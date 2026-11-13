@@ -228,6 +228,11 @@
 #define BOARD_SD_SCLK        (12)
 #define BOARD_SD_MISO        (13)
 
+// PCF8575 16-bit I/O expander on its own I2C bus (port 1); buttons on P00-P07.
+// GPIO43/44 are the UART0 pins - free because the console runs over USB-Serial-JTAG.
+#define BOARD_EXP_SDA        (43)
+#define BOARD_EXP_SCL        (44)
+
 #define AMOLED_WIDTH         (170)
 #define AMOLED_HEIGHT        (320)
 

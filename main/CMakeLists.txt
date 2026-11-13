@@ -14,4 +14,5 @@ idf_component_register(SRCS
     "display_rgb.cpp"
     "display_watch_s3.c"
     "sd_card.c"
+    "pcf8575.c"
     INCLUDE_DIRS ".")

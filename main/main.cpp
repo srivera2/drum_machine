@@ -28,7 +28,7 @@
 #include "tft_driver.h"
 #include "product_pins.h"
 #include "sd_card.h"
-#include <dirent.h>
+#include "pcf8575.h"
 
 
 static const char *TAG = "main";
@@ -127,46 +127,248 @@ extern "C" {
     void example_lvgl_demo_ui(lv_disp_t *disp);
 }
 
-// SD card test screen: lists the root directory of the card.
+// ---------------------------------------------------------------------------
+// Button test: 8 buttons on PCF8575 P00-P07, active low (pressed = 0).
+// ---------------------------------------------------------------------------
+#define NUM_BUTTONS        8
+#define BUTTON_POLL_MS     2    // needs CONFIG_FREERTOS_HZ=1000 to actually be 2 ms
+#define BUTTON_RELEASE_MS  20   // must read released this long before it can trigger again
+#define BUTTON_UI_MS       20   // how often the screen picks up button state
+#define BUTTON_FLASH_MS    100  // minimum time an LED stays lit per hit, so short taps are visible
+#define BUTTON_TASK_PRIO   5    // above LVGL / app tasks so screen work can't delay polling
+
+static lv_obj_t *s_btn_label = NULL;
+static lv_obj_t *s_btn_led[NUM_BUTTONS];
+static lv_obj_t *s_btn_count[NUM_BUTTONS];
+
+// Poll task -> UI. The poll task never touches LVGL or the log, so neither a
+// slow screen redraw nor a blocked USB console can make it miss a hit.
+static QueueHandle_t s_btn_events = NULL;   // uint8_t button index, one per hit
+static volatile uint8_t s_btn_held = 0;     // debounced: bit i set = button i held
+
+// Written only by the poll task, read by the UI and the stats logger.
+static struct {
+    volatile uint32_t hits[NUM_BUTTONS];         // debounced hits
+    volatile uint32_t raw_lows[NUM_BUTTONS];     // raw high->low transitions (includes bounce)
+    volatile uint32_t min_press_us[NUM_BUTTONS]; // shortest hit -> release time
+    volatile uint32_t max_gap_us;                // longest time between two polls
+    volatile uint32_t read_errors;
+} s_stats;
+
+static void button_ui_timer_cb(lv_timer_t *timer);
+
+#define LED_OFF_COLOR  lv_palette_darken(LV_PALETTE_GREY, 3)
+#define LED_ON_COLOR   lv_palette_main(LV_PALETTE_GREEN)
+
+// Full-screen button test (320x170):
+//   status line   (top)
+//   "Button N"    (center, large)
+//   8 LEDs 1-8 with hit counters underneath (bottom)
 // Must be called with the LVGL lock held.
-static void sd_test_screen_create(esp_err_t mount_result)
+static void button_test_screen_create(esp_err_t exp_result)
 {
     lv_obj_t *scr = lv_scr_act();
+    lv_obj_clean(scr);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_text_color(scr, lv_color_white(), 0);
 
-    lv_obj_t *title = lv_label_create(scr);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_t *status = lv_label_create(scr);
+    lv_obj_align(status, LV_ALIGN_TOP_MID, 0, 6);
 
-    if (mount_result != ESP_OK) {
-        lv_label_set_text_fmt(title, "SD mount failed: %s", esp_err_to_name(mount_result));
-        lv_obj_set_style_text_color(title, lv_palette_main(LV_PALETTE_RED), 0);
+    if (exp_result != ESP_OK) {
+        lv_label_set_text_fmt(status, "PCF8575 not found (%s)", esp_err_to_name(exp_result));
+        lv_obj_set_style_text_color(status, lv_palette_main(LV_PALETTE_RED), 0);
+        lv_obj_t *hint = lv_label_create(scr);
+        lv_label_set_text(hint, "Check wiring - see serial log");
+        lv_obj_center(hint);
         return;
     }
+    lv_label_set_text_fmt(status, "PCF8575 @ 0x%02X", pcf8575_address());
+    lv_obj_set_style_text_color(status, lv_palette_main(LV_PALETTE_GREY), 0);
 
-    lv_obj_t *list = lv_list_create(scr);
-    lv_obj_set_size(list, LV_HOR_RES, LV_VER_RES - 24);
-    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
+    s_btn_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(s_btn_label, &lv_font_montserrat_28, 0);
+    lv_label_set_text(s_btn_label, "Press a button");
+    lv_obj_align(s_btn_label, LV_ALIGN_CENTER, 0, -18);
 
-    DIR *dir = opendir(SD_MOUNT_POINT);
-    if (!dir) {
-        lv_label_set_text(title, "SD mounted, but opendir failed");
-        return;
+    // Row of 8 columns (LED + hit counter). Plain flex containers with all
+    // theme styling removed, so default padding/borders don't push things around.
+    lv_obj_t *row = lv_obj_create(scr);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_HOR_RES, LV_SIZE_CONTENT);
+    lv_obj_align(row, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (int i = 0; i < NUM_BUTTONS; i++) {
+        lv_obj_t *col = lv_obj_create(row);
+        lv_obj_remove_style_all(col);
+        lv_obj_set_size(col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(col, 4, 0);
+        lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *led = lv_obj_create(col);
+        lv_obj_remove_style_all(led);
+        lv_obj_set_size(led, 30, 30);
+        lv_obj_set_style_radius(led, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(led, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(led, LED_OFF_COLOR, 0);
+        lv_obj_clear_flag(led, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *num = lv_label_create(led);
+        lv_label_set_text_fmt(num, "%d", i + 1);
+        lv_obj_center(num);
+
+        lv_obj_t *count = lv_label_create(col);
+        lv_obj_set_style_text_font(count, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(count, lv_palette_main(LV_PALETTE_GREY), 0);
+        lv_label_set_text(count, "0");
+
+        s_btn_led[i] = led;
+        s_btn_count[i] = count;
     }
 
-    int count = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        bool is_dir = entry->d_type == DT_DIR;
-        ESP_LOGI(TAG, "  %s%s", entry->d_name, is_dir ? "/" : "");
-        lv_list_add_btn(list, is_dir ? LV_SYMBOL_DIRECTORY : LV_SYMBOL_FILE, entry->d_name);
-        count++;
-    }
-    closedir(dir);
+    s_btn_events = xQueueCreate(32, sizeof(uint8_t));
+    assert(s_btn_events);
+    lv_timer_create(button_ui_timer_cb, BUTTON_UI_MS, NULL);
+}
 
-    lv_label_set_text_fmt(title, SD_MOUNT_POINT "  (%d entries)", count);
-    if (count == 0) {
-        lv_list_add_text(list, "Card is empty");
+// Runs inside lv_timer_handler(), so the LVGL lock is already held.
+static void button_ui_timer_cb(lv_timer_t *timer)
+{
+    static uint32_t flash_until[NUM_BUTTONS];
+    static uint32_t shown_hits[NUM_BUTTONS];
+    static bool shown_on[NUM_BUTTONS];
+    uint32_t now = lv_tick_get();
+
+    uint8_t idx;
+    while (xQueueReceive(s_btn_events, &idx, 0) == pdTRUE) {   // last hit wins the big label
+        flash_until[idx] = now + BUTTON_FLASH_MS;
+        lv_obj_set_style_text_font(s_btn_label, &lv_font_montserrat_40, 0);
+        lv_label_set_text_fmt(s_btn_label, "Button %d", idx + 1);
+        lv_obj_align(s_btn_label, LV_ALIGN_CENTER, 0, -18);   // re-center for new width
+    }
+
+    uint8_t held = s_btn_held;
+    for (int i = 0; i < NUM_BUTTONS; i++) {
+        bool on = (held & (1 << i)) || (int32_t)(flash_until[i] - now) > 0;
+        if (on != shown_on[i]) {
+            lv_obj_set_style_bg_color(s_btn_led[i], on ? LED_ON_COLOR : LED_OFF_COLOR, 0);
+            shown_on[i] = on;
+        }
+        uint32_t hits = s_stats.hits[i];
+        if (hits != shown_hits[i]) {
+            lv_label_set_text_fmt(s_btn_count[i], "%lu", (unsigned long)hits);
+            shown_hits[i] = hits;
+        }
     }
 }
+
+// Debounce tuned for drum triggers (arcade microswitches):
+//  - A hit fires on the FIRST read that sees the button down -> latency is
+//    at most one poll interval, and short taps can't be missed.
+//  - After that the button is "held" and ignores all bounce until it has read
+//    released continuously for BUTTON_RELEASE_MS. Only then can it fire again.
+// No logging in here: a console write can block for tens of ms when no
+// serial monitor is attached, which would stall polling.
+static void button_poll_task(void *arg)
+{
+    uint8_t held = 0;                       // bit i set = button i held
+    uint8_t prev_down = 0;                  // last raw reading, for raw edge stats
+    int64_t up_since[NUM_BUTTONS] = {0};    // held buttons: when they started reading released (0 = reading down)
+    int64_t hit_at[NUM_BUTTONS] = {0};
+    int64_t last_poll = 0;
+    TickType_t last_wake = xTaskGetTickCount();
+
+    for (int i = 0; i < NUM_BUTTONS; i++) {
+        s_stats.min_press_us[i] = UINT32_MAX;
+    }
+
+    while (1) {
+        int64_t now = esp_timer_get_time();
+        if (last_poll && (uint32_t)(now - last_poll) > s_stats.max_gap_us) {
+            s_stats.max_gap_us = now - last_poll;
+        }
+        last_poll = now;
+
+        uint16_t port;
+        if (pcf8575_read(&port) == ESP_OK) {
+            uint8_t down = ~port & 0xFF;    // active low: 0 on the pin = pressed
+            uint8_t new_lows = down & ~prev_down;
+            prev_down = down;
+
+            for (int i = 0; i < NUM_BUTTONS; i++) {
+                uint8_t bit = 1 << i;
+                if (new_lows & bit) {
+                    s_stats.raw_lows[i] = s_stats.raw_lows[i] + 1;
+                }
+                if (!(held & bit)) {
+                    if (down & bit) {                       // new hit
+                        held |= bit;
+                        up_since[i] = 0;
+                        hit_at[i] = now;
+                        s_stats.hits[i] = s_stats.hits[i] + 1;
+                        uint8_t idx = i;
+                        if (s_btn_events) {
+                            xQueueSend(s_btn_events, &idx, 0);  // drop if UI is behind
+                        }
+                    }
+                } else if (down & bit) {
+                    up_since[i] = 0;                        // still down, or bouncing
+                } else if (up_since[i] == 0) {
+                    up_since[i] = now;                      // first released read
+                } else if (now - up_since[i] >= BUTTON_RELEASE_MS * 1000) {
+                    held &= ~bit;                           // released for good: re-arm
+                    uint32_t press = up_since[i] - hit_at[i];
+                    if (press < s_stats.min_press_us[i]) {
+                        s_stats.min_press_us[i] = press;
+                    }
+                }
+            }
+            s_btn_held = held;
+        } else {
+            s_stats.read_errors = s_stats.read_errors + 1;
+        }
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(BUTTON_POLL_MS));
+    }
+}
+
+// Low-priority logger: once there's been any activity, prints the cumulative
+// stats every 2 s (repeating, so a monitor attached later still sees them).
+// raw > hits is normal (bounce); hits < actual presses means a miss.
+static void button_stats_task(void *arg)
+{
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        uint32_t total = 0;
+        for (int i = 0; i < NUM_BUTTONS; i++) {
+            total += s_stats.raw_lows[i];
+        }
+        if (total == 0 && s_stats.read_errors == 0) {
+            continue;
+        }
+
+        char line[256] = "";
+        int n = 0;
+        for (int i = 0; i < NUM_BUTTONS && n < (int)sizeof(line); i++) {
+            if (!s_stats.raw_lows[i]) {
+                continue;
+            }
+            uint32_t mp = s_stats.min_press_us[i];
+            n += snprintf(line + n, sizeof(line) - n, "B%d hits=%lu raw=%lu min=%s%lums  ",
+                          i + 1, (unsigned long)s_stats.hits[i], (unsigned long)s_stats.raw_lows[i],
+                          mp == UINT32_MAX ? "-" : "", mp == UINT32_MAX ? 0UL : (unsigned long)(mp / 1000));
+        }
+        ESP_LOGI(TAG, "%s| max_gap=%lu.%lums read_err=%lu", line,
+                 (unsigned long)(s_stats.max_gap_us / 1000), (unsigned long)(s_stats.max_gap_us % 1000 / 100),
+                 (unsigned long)s_stats.read_errors);
+    }
+}
+
 
 extern "C" void app_main(void)
 {
@@ -186,7 +388,10 @@ extern "C" void app_main(void)
     display_init();
 
     ESP_LOGI(TAG, "------ Initialize SD CARD.");
-    esp_err_t sd_result = sd_card_init();
+    sd_card_init();     // mounted at /sdcard; result is logged by the driver
+
+    ESP_LOGI(TAG, "------ Initialize IO EXPANDER.");
+    esp_err_t exp_result = pcf8575_init();
 
 
     ESP_LOGI(TAG, "Initialize LVGL library");
@@ -268,10 +473,10 @@ extern "C" void app_main(void)
 // #elif CONFIG_USE_DEMO_STRESS
 //         lv_demo_stress();
 // #elif CONFIG_USE_DEMO_MUSIC
-        if (sd_result == ESP_ERR_NOT_SUPPORTED) {
-            lv_demo_music();
+        if (exp_result == ESP_ERR_NOT_SUPPORTED) {
+            lv_demo_music();    // boards without the expander
         } else {
-            sd_test_screen_create(sd_result);
+            button_test_screen_create(exp_result);
         }
 // #endif
         // Release the mutex
@@ -281,5 +486,10 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Create LVGL task");
     // xTaskCreate(example_lvgl_port_task, "LVGL", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, EXAMPLE_LVGL_TASK_PRIORITY, NULL);
     xTaskCreate(example_lvgl_port_task, "LVGL", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, tskIDLE_PRIORITY, NULL);
+
+    if (exp_result == ESP_OK) {
+        xTaskCreate(button_poll_task, "buttons", 4096, NULL, BUTTON_TASK_PRIO, NULL);
+        xTaskCreate(button_stats_task, "btn_stats", 4096, NULL, 1, NULL);
+    }
 
 }

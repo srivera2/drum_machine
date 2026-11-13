@@ -28,7 +28,9 @@
 #include "tft_driver.h"
 #include "product_pins.h"
 #include "sd_card.h"
+#include "ext_i2c.h"
 #include "pcf8575.h"
+#include "ads1115.h"
 
 
 static const char *TAG = "main";
@@ -137,7 +139,28 @@ extern "C" {
 #define BUTTON_FLASH_MS    100  // minimum time an LED stays lit per hit, so short taps are visible
 #define BUTTON_TASK_PRIO   5    // above LVGL / app tasks so screen work can't delay polling
 
+// 8-position switch on the second expander, P10-P17 (common to GND: the
+// selected position reads 0, all others 1).
+#define SWITCH_POLL_DIV      5   // read every 5th button poll = every 10 ms
+#define SWITCH_STABLE_READS  2   // same single position this many reads in a row (~20 ms)
+
+// 4 pots on the ADS1115, AIN0-AIN3. Not timing critical: own low-priority task.
+#define NUM_POTS             4
+#define POT_PERIOD_MS        10    // pause between sweeps (a sweep of 4 takes ~10 ms)
+#define POT_TASK_PRIO        2     // below the button poller
+#define POT_FULL_SCALE_MV    3300  // pot supply voltage = 100%
+
+static pcf8575_handle_t s_exp_buttons = NULL;
+static pcf8575_handle_t s_exp_switch = NULL;
+static ads1115_handle_t s_adc = NULL;
+static volatile int8_t s_switch_pos = -1;   // debounced position 0-7, -1 = not known yet
+static volatile int s_pot_mv[NUM_POTS];      // latest reading per pot, millivolts
+static volatile uint32_t s_pot_errors = 0;
+
 static lv_obj_t *s_btn_label = NULL;
+static lv_obj_t *s_pos_label = NULL;
+static lv_obj_t *s_pot_bar[NUM_POTS];
+static lv_obj_t *s_pot_value[NUM_POTS];
 static lv_obj_t *s_btn_led[NUM_BUTTONS];
 static lv_obj_t *s_btn_count[NUM_BUTTONS];
 
@@ -160,12 +183,75 @@ static void button_ui_timer_cb(lv_timer_t *timer);
 #define LED_OFF_COLOR  lv_palette_darken(LV_PALETTE_GREY, 3)
 #define LED_ON_COLOR   lv_palette_main(LV_PALETTE_GREEN)
 
-// Full-screen button test (320x170):
-//   status line   (top)
-//   "Button N"    (center, large)
-//   8 LEDs 1-8 with hit counters underneath (bottom)
-// Must be called with the LVGL lock held.
-static void button_test_screen_create(esp_err_t exp_result)
+// Left half holds the text, right half the pot bars.
+#define LEFT_X        (-(LV_HOR_RES / 4))   // TOP_MID x-offset that centers in the left half
+#define BTN_LABEL_Y   26      // "Button N"
+#define POS_LABEL_Y   62      // "Position N"
+
+static int pot_permille(int mv)
+{
+    int p = mv * 1000 / POT_FULL_SCALE_MV;
+    return p < 0 ? 0 : (p > 1000 ? 1000 : p);
+}
+
+static void label_set_error(lv_obj_t *label, const char *what, esp_err_t err)
+{
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(label, lv_palette_main(LV_PALETTE_RED), 0);
+    lv_label_set_text_fmt(label, "%s not found (%s)", what, esp_err_to_name(err));
+}
+
+// Right half: 4 vertical bars (one per pot) with a % readout under each.
+static void pot_panel_create(lv_obj_t *scr, esp_err_t adc_result)
+{
+    if (adc_result != ESP_OK) {
+        lv_obj_t *err = lv_label_create(scr);
+        lv_obj_set_width(err, LV_HOR_RES / 2 - 8);
+        lv_label_set_long_mode(err, LV_LABEL_LONG_WRAP);
+        label_set_error(err, "ADC", adc_result);
+        lv_obj_align(err, LV_ALIGN_TOP_RIGHT, -4, BTN_LABEL_Y);
+        return;
+    }
+
+    lv_obj_t *panel = lv_obj_create(scr);
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_size(panel, LV_HOR_RES / 2, LV_SIZE_CONTENT);
+    lv_obj_align(panel, LV_ALIGN_TOP_RIGHT, 0, 24);
+    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (int i = 0; i < NUM_POTS; i++) {
+        lv_obj_t *col = lv_obj_create(panel);
+        lv_obj_remove_style_all(col);
+        lv_obj_set_size(col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(col, 4, 0);
+        lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *bar = lv_bar_create(col);         // taller than wide -> vertical
+        lv_obj_set_size(bar, 16, 56);
+        lv_bar_set_range(bar, 0, 1000);
+        lv_obj_set_style_bg_color(bar, LED_OFF_COLOR, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(bar, lv_palette_main(LV_PALETTE_ORANGE), LV_PART_INDICATOR);
+
+        lv_obj_t *val = lv_label_create(col);
+        lv_obj_set_style_text_font(val, &lv_font_montserrat_12, 0);
+        lv_label_set_text(val, "--");
+
+        s_pot_bar[i] = bar;
+        s_pot_value[i] = val;
+    }
+}
+
+// Full-screen input test (320x170):
+//   status line                                   (top, small)
+//   left: "Button N" / "Position N"   right: 4 pot bars
+//   8 LEDs 1-8 with hit counters                  (bottom)
+// Each board is reported independently, so one missing board doesn't
+// hide the others. Must be called with the LVGL lock held.
+static void input_test_screen_create(esp_err_t btn_result, esp_err_t sw_result, esp_err_t adc_result)
 {
     lv_obj_t *scr = lv_scr_act();
     lv_obj_clean(scr);
@@ -174,23 +260,36 @@ static void button_test_screen_create(esp_err_t exp_result)
     lv_obj_set_style_text_color(scr, lv_color_white(), 0);
 
     lv_obj_t *status = lv_label_create(scr);
-    lv_obj_align(status, LV_ALIGN_TOP_MID, 0, 6);
-
-    if (exp_result != ESP_OK) {
-        lv_label_set_text_fmt(status, "PCF8575 not found (%s)", esp_err_to_name(exp_result));
-        lv_obj_set_style_text_color(status, lv_palette_main(LV_PALETTE_RED), 0);
-        lv_obj_t *hint = lv_label_create(scr);
-        lv_label_set_text(hint, "Check wiring - see serial log");
-        lv_obj_center(hint);
-        return;
-    }
-    lv_label_set_text_fmt(status, "PCF8575 @ 0x%02X", pcf8575_address());
+    lv_obj_set_style_text_font(status, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(status, lv_palette_main(LV_PALETTE_GREY), 0);
+    lv_label_set_text_fmt(status, "Btn 0x%02X %s   Sw 0x%02X %s   ADC 0x%02X %s",
+                          BOARD_EXP_BUTTONS_ADDR, btn_result == ESP_OK ? "OK" : "--",
+                          BOARD_EXP_SWITCH_ADDR, sw_result == ESP_OK ? "OK" : "--",
+                          BOARD_EXP_ADC_ADDR, adc_result == ESP_OK ? "OK" : "--");
+    lv_obj_align(status, LV_ALIGN_TOP_MID, 0, 4);
+
+    pot_panel_create(scr, adc_result);
+
+    s_pos_label = lv_label_create(scr);
+    if (sw_result == ESP_OK) {
+        lv_obj_set_style_text_font(s_pos_label, &lv_font_montserrat_28, 0);
+        lv_label_set_text(s_pos_label, "Position -");
+    } else {
+        label_set_error(s_pos_label, "Switch", sw_result);
+    }
+    lv_obj_align(s_pos_label, LV_ALIGN_TOP_MID, LEFT_X, POS_LABEL_Y);
 
     s_btn_label = lv_label_create(scr);
-    lv_obj_set_style_text_font(s_btn_label, &lv_font_montserrat_28, 0);
+    if (btn_result != ESP_OK) {
+        label_set_error(s_btn_label, "Buttons", btn_result);
+        lv_obj_align(s_btn_label, LV_ALIGN_TOP_MID, LEFT_X, BTN_LABEL_Y);
+        s_btn_label = NULL;
+        lv_timer_create(button_ui_timer_cb, BUTTON_UI_MS, NULL);   // still drives switch + pots
+        return;
+    }
+    lv_obj_set_style_text_font(s_btn_label, &lv_font_montserrat_20, 0);
     lv_label_set_text(s_btn_label, "Press a button");
-    lv_obj_align(s_btn_label, LV_ALIGN_CENTER, 0, -18);
+    lv_obj_align(s_btn_label, LV_ALIGN_TOP_MID, LEFT_X, BTN_LABEL_Y);
 
     // Row of 8 columns (LED + hit counter). Plain flex containers with all
     // theme styling removed, so default padding/borders don't push things around.
@@ -243,14 +342,37 @@ static void button_ui_timer_cb(lv_timer_t *timer)
     static uint32_t flash_until[NUM_BUTTONS];
     static uint32_t shown_hits[NUM_BUTTONS];
     static bool shown_on[NUM_BUTTONS];
+    static int8_t shown_pos = -1;
+    static int shown_pot[NUM_POTS] = {-100, -100, -100, -100};
     uint32_t now = lv_tick_get();
 
+    int8_t pos = s_switch_pos;
+    if (s_exp_switch && pos != shown_pos) {
+        lv_label_set_text_fmt(s_pos_label, "Position %d", pos + 1);
+        lv_obj_align(s_pos_label, LV_ALIGN_TOP_MID, LEFT_X, POS_LABEL_Y);   // re-center for new width
+        shown_pos = pos;
+    }
+
+    if (s_adc) {
+        for (int i = 0; i < NUM_POTS; i++) {
+            int p = pot_permille(s_pot_mv[i]);
+            if (abs(p - shown_pot[i]) >= 5) {       // 0.5% deadband: no redraws on ADC noise
+                lv_bar_set_value(s_pot_bar[i], p, LV_ANIM_OFF);
+                lv_label_set_text_fmt(s_pot_value[i], "%d%%", (p + 5) / 10);
+                shown_pot[i] = p;
+            }
+        }
+    }
+
+    if (!s_btn_label) {
+        return;     // buttons board missing
+    }
+
     uint8_t idx;
-    while (xQueueReceive(s_btn_events, &idx, 0) == pdTRUE) {   // last hit wins the big label
+    while (xQueueReceive(s_btn_events, &idx, 0) == pdTRUE) {   // last hit wins the label
         flash_until[idx] = now + BUTTON_FLASH_MS;
-        lv_obj_set_style_text_font(s_btn_label, &lv_font_montserrat_40, 0);
         lv_label_set_text_fmt(s_btn_label, "Button %d", idx + 1);
-        lv_obj_align(s_btn_label, LV_ALIGN_CENTER, 0, -18);   // re-center for new width
+        lv_obj_align(s_btn_label, LV_ALIGN_TOP_MID, LEFT_X, BTN_LABEL_Y);  // re-center for new width
     }
 
     uint8_t held = s_btn_held;
@@ -283,6 +405,9 @@ static void button_poll_task(void *arg)
     int64_t hit_at[NUM_BUTTONS] = {0};
     int64_t last_poll = 0;
     TickType_t last_wake = xTaskGetTickCount();
+    int switch_div = 0;
+    int8_t sw_candidate = -1;
+    int sw_count = 0;
 
     for (int i = 0; i < NUM_BUTTONS; i++) {
         s_stats.min_press_us[i] = UINT32_MAX;
@@ -296,7 +421,34 @@ static void button_poll_task(void *arg)
         last_poll = now;
 
         uint16_t port;
-        if (pcf8575_read(&port) == ESP_OK) {
+
+        // Switch: slow, not timing critical. Only accept a reading with exactly
+        // one position closed; between detents a rotary switch may show none
+        // (or two, if make-before-break), so keep the last good position.
+        if (s_exp_switch && ++switch_div >= SWITCH_POLL_DIV) {
+            switch_div = 0;
+            if (pcf8575_read(s_exp_switch, &port) == ESP_OK) {
+                uint8_t closed = ~(port >> 8) & 0xFF;     // P10-P17, active low
+                if (closed && !(closed & (closed - 1))) { // exactly one bit set
+                    int8_t pos = __builtin_ctz(closed);
+                    if (pos == sw_candidate) {
+                        if (++sw_count >= SWITCH_STABLE_READS) {
+                            s_switch_pos = pos;
+                        }
+                    } else {
+                        sw_candidate = pos;
+                        sw_count = 1;
+                    }
+                }
+            }
+        }
+
+        if (!s_exp_buttons) {
+            vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(BUTTON_POLL_MS));
+            continue;
+        }
+
+        if (pcf8575_read(s_exp_buttons, &port) == ESP_OK) {
             uint8_t down = ~port & 0xFF;    // active low: 0 on the pin = pressed
             uint8_t new_lows = down & ~prev_down;
             prev_down = down;
@@ -337,13 +489,63 @@ static void button_poll_task(void *arg)
     }
 }
 
+// Reads all pots in a loop. Each conversion sleeps ~2 ms, during which the
+// bus is free for the button poller, so this never delays a hit.
+static void pot_task(void *arg)
+{
+    while (1) {
+        for (int i = 0; i < NUM_POTS; i++) {
+            int mv;
+            if (ads1115_read_mv(s_adc, i, &mv) == ESP_OK) {
+                s_pot_mv[i] = mv;
+            } else {
+                s_pot_errors = s_pot_errors + 1;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(POT_PERIOD_MS));
+    }
+}
+
 // Low-priority logger: once there's been any activity, prints the cumulative
 // stats every 2 s (repeating, so a monitor attached later still sees them).
 // raw > hits is normal (bounce); hits < actual presses means a miss.
+// Also logs switch position and pot changes as they happen.
 static void button_stats_task(void *arg)
 {
+    int8_t logged_pos = -1;
+    int logged_pot[NUM_POTS] = {-100, -100, -100, -100};
+    int tick = 0;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        int8_t pos = s_switch_pos;
+        if (pos != logged_pos) {
+            ESP_LOGI(TAG, "Switch position %d (P1%d)", pos + 1, pos);
+            logged_pos = pos;
+        }
+
+        if (s_adc) {
+            int mv[NUM_POTS];
+            bool changed = false;
+            for (int i = 0; i < NUM_POTS; i++) {
+                mv[i] = s_pot_mv[i];
+                if (abs(mv[i] - logged_pot[i]) >= 50) {   // log moves of >= 50 mV (~1.5%)
+                    changed = true;
+                }
+            }
+            if (changed) {
+                ESP_LOGI(TAG, "Pots (mV): %4d %4d %4d %4d   err=%lu",
+                         mv[0], mv[1], mv[2], mv[3], (unsigned long)s_pot_errors);
+                for (int i = 0; i < NUM_POTS; i++) {
+                    logged_pot[i] = mv[i];
+                }
+            }
+        }
+        if (++tick < 20) {          // button stats every 2 s
+            continue;
+        }
+        tick = 0;
+
         uint32_t total = 0;
         for (int i = 0; i < NUM_BUTTONS; i++) {
             total += s_stats.raw_lows[i];
@@ -390,8 +592,18 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "------ Initialize SD CARD.");
     sd_card_init();     // mounted at /sdcard; result is logged by the driver
 
-    ESP_LOGI(TAG, "------ Initialize IO EXPANDER.");
-    esp_err_t exp_result = pcf8575_init();
+    ESP_LOGI(TAG, "------ Initialize EXTERNAL I2C (expanders, ADC).");
+    esp_err_t exp_result = ext_i2c_init();
+    esp_err_t btn_result = exp_result;
+    esp_err_t sw_result = exp_result;
+    esp_err_t adc_result = exp_result;
+#ifdef BOARD_EXP_BUTTONS_ADDR
+    if (exp_result == ESP_OK) {
+        btn_result = pcf8575_open(BOARD_EXP_BUTTONS_ADDR, &s_exp_buttons);
+        sw_result = pcf8575_open(BOARD_EXP_SWITCH_ADDR, &s_exp_switch);
+        adc_result = ads1115_open(BOARD_EXP_ADC_ADDR, &s_adc);
+    }
+#endif
 
 
     ESP_LOGI(TAG, "Initialize LVGL library");
@@ -476,7 +688,7 @@ extern "C" void app_main(void)
         if (exp_result == ESP_ERR_NOT_SUPPORTED) {
             lv_demo_music();    // boards without the expander
         } else {
-            button_test_screen_create(exp_result);
+            input_test_screen_create(btn_result, sw_result, adc_result);
         }
 // #endif
         // Release the mutex
@@ -487,8 +699,13 @@ extern "C" void app_main(void)
     // xTaskCreate(example_lvgl_port_task, "LVGL", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, EXAMPLE_LVGL_TASK_PRIORITY, NULL);
     xTaskCreate(example_lvgl_port_task, "LVGL", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, tskIDLE_PRIORITY, NULL);
 
-    if (exp_result == ESP_OK) {
+    if (s_exp_buttons || s_exp_switch) {
         xTaskCreate(button_poll_task, "buttons", 4096, NULL, BUTTON_TASK_PRIO, NULL);
+    }
+    if (s_adc) {
+        xTaskCreate(pot_task, "pots", 3072, NULL, POT_TASK_PRIO, NULL);
+    }
+    if (s_exp_buttons || s_exp_switch || s_adc) {
         xTaskCreate(button_stats_task, "btn_stats", 4096, NULL, 1, NULL);
     }
 

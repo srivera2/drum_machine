@@ -1,10 +1,13 @@
 /**
  * @file      pcf8575.h
- * @brief     Minimal driver for the PCF8575 16-bit quasi-bidirectional I/O expander.
+ * @brief     Minimal driver for PCF8575 16-bit quasi-bidirectional I/O expanders.
+ *
+ * Expanders live on the shared external bus (see ext_i2c.h), each at its own
+ * address (0x20-0x27 via A2..A0). Call ext_i2c_init() first.
  *
  * Bit layout of the 16-bit port value: bit 0..7 = P00..P07, bit 8..15 = P10..P17.
  * A pin written as 1 is weakly pulled high and can be used as an input;
- * a button to GND then reads 0 while pressed.
+ * a switch to GND then reads 0 while closed.
  */
 #pragma once
 
@@ -15,22 +18,22 @@
 extern "C" {
 #endif
 
+typedef struct pcf8575_dev *pcf8575_handle_t;
+
 /**
- * Create a dedicated I2C bus on BOARD_EXP_SDA/SCL, find the PCF8575 at
- * 0x20-0x27, and release all pins high so they act as inputs.
- * Returns ESP_ERR_NOT_SUPPORTED if the board has no BOARD_EXP_* pins,
- * ESP_ERR_NOT_FOUND if no device answers.
+ * Attach the expander at `addr` and release all its pins high (inputs).
+ * Returns ESP_ERR_NOT_FOUND if nothing answers at that address.
  */
-esp_err_t pcf8575_init(void);
+esp_err_t pcf8575_open(uint8_t addr, pcf8575_handle_t *out);
 
 /** Read all 16 pins. */
-esp_err_t pcf8575_read(uint16_t *value);
+esp_err_t pcf8575_read(pcf8575_handle_t dev, uint16_t *value);
 
 /** Write all 16 pins (1 = released/input, 0 = driven low). */
-esp_err_t pcf8575_write(uint16_t value);
+esp_err_t pcf8575_write(pcf8575_handle_t dev, uint16_t value);
 
-/** I2C address the device was found at (0 if not initialized). */
-uint8_t pcf8575_address(void);
+/** I2C address of an opened device. */
+uint8_t pcf8575_address(pcf8575_handle_t dev);
 
 #ifdef __cplusplus
 }

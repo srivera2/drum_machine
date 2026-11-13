@@ -175,7 +175,7 @@ bool power_driver_init()
 {
 #ifdef BOARD_POWERON
     ESP_LOGI(TAG, "Turn on board power pin");
-    gpio_config_t poweron_gpio_config = {0};
+    gpio_config_t poweron_gpio_config = {};
     poweron_gpio_config.pin_bit_mask = 1ULL << BOARD_POWERON;
     poweron_gpio_config.mode = GPIO_MODE_OUTPUT;
     ESP_ERROR_CHECK(gpio_config(&poweron_gpio_config));
@@ -184,7 +184,7 @@ bool power_driver_init()
 
 #ifdef BOARD_POWERON1
     ESP_LOGI(TAG, "Turn on board power pin");
-    gpio_config_t poweron1_gpio_config = {0};
+    gpio_config_t poweron1_gpio_config = {};
     poweron1_gpio_config.pin_bit_mask = 1ULL << BOARD_POWERON1;
     poweron1_gpio_config.mode = GPIO_MODE_OUTPUT;
     ESP_ERROR_CHECK(gpio_config(&poweron1_gpio_config));

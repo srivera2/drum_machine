@@ -27,6 +27,8 @@
 #include "demos/lv_demos.h"
 #include "tft_driver.h"
 #include "product_pins.h"
+#include "sd_card.h"
+#include <dirent.h>
 
 
 static const char *TAG = "main";
@@ -125,6 +127,47 @@ extern "C" {
     void example_lvgl_demo_ui(lv_disp_t *disp);
 }
 
+// SD card test screen: lists the root directory of the card.
+// Must be called with the LVGL lock held.
+static void sd_test_screen_create(esp_err_t mount_result)
+{
+    lv_obj_t *scr = lv_scr_act();
+
+    lv_obj_t *title = lv_label_create(scr);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 4);
+
+    if (mount_result != ESP_OK) {
+        lv_label_set_text_fmt(title, "SD mount failed: %s", esp_err_to_name(mount_result));
+        lv_obj_set_style_text_color(title, lv_palette_main(LV_PALETTE_RED), 0);
+        return;
+    }
+
+    lv_obj_t *list = lv_list_create(scr);
+    lv_obj_set_size(list, LV_HOR_RES, LV_VER_RES - 24);
+    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    DIR *dir = opendir(SD_MOUNT_POINT);
+    if (!dir) {
+        lv_label_set_text(title, "SD mounted, but opendir failed");
+        return;
+    }
+
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        bool is_dir = entry->d_type == DT_DIR;
+        ESP_LOGI(TAG, "  %s%s", entry->d_name, is_dir ? "/" : "");
+        lv_list_add_btn(list, is_dir ? LV_SYMBOL_DIRECTORY : LV_SYMBOL_FILE, entry->d_name);
+        count++;
+    }
+    closedir(dir);
+
+    lv_label_set_text_fmt(title, SD_MOUNT_POINT "  (%d entries)", count);
+    if (count == 0) {
+        lv_list_add_text(list, "Card is empty");
+    }
+}
+
 extern "C" void app_main(void)
 {
 
@@ -141,6 +184,9 @@ extern "C" void app_main(void)
 
     ESP_LOGI(TAG, "------ Initialize DISPLAY.");
     display_init();
+
+    ESP_LOGI(TAG, "------ Initialize SD CARD.");
+    esp_err_t sd_result = sd_card_init();
 
 
     ESP_LOGI(TAG, "Initialize LVGL library");
@@ -222,7 +268,11 @@ extern "C" void app_main(void)
 // #elif CONFIG_USE_DEMO_STRESS
 //         lv_demo_stress();
 // #elif CONFIG_USE_DEMO_MUSIC
-        lv_demo_music();
+        if (sd_result == ESP_ERR_NOT_SUPPORTED) {
+            lv_demo_music();
+        } else {
+            sd_test_screen_create(sd_result);
+        }
 // #endif
         // Release the mutex
         example_lvgl_unlock();

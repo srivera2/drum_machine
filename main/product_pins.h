@@ -221,6 +221,13 @@
 #define BOARD_I2C_SDA        (18)
 #define BOARD_TOUCH_IRQ      (16)
 #define BOARD_TOUCH_RST      (21)
+
+// External SD card reader (SPI mode, on SPI2 - the LCD uses the i80 bus, so SPI2 is free)
+#define BOARD_SD_CS          (10)
+#define BOARD_SD_MOSI        (11)
+#define BOARD_SD_SCLK        (12)
+#define BOARD_SD_MISO        (13)
+
 #define AMOLED_WIDTH         (170)
 #define AMOLED_HEIGHT        (320)
 
